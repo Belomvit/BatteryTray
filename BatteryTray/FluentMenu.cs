@@ -5,34 +5,26 @@ using System.Runtime.InteropServices;
 
 namespace BatteryTray;
 
-/// Gives a context menu (and its submenus) the Windows 11 look when the current skin asks for it:
+/// Gives a context menu (and its submenus) the Windows 11 look, whatever the widget style:
 /// rounded corners, light/dark surface, rounded hover pills, Fluent check marks and chevrons.
-/// Otherwise the menu keeps the stock WinForms look.
 static class FluentMenu
 {
-    public static void Apply(ContextMenuStrip menu, Func<bool> fluent)
+    public static void Apply(ContextMenuStrip menu)
     {
-        var fluentRenderer = new Renderer();
-        var stockRenderer = new ToolStripProfessionalRenderer();
-        var fluentFont = new Font("Segoe UI Variable Text", 10f);
-        var stockFont = SystemFonts.MenuFont ?? Control.DefaultFont;
+        var renderer = new Renderer();
+        var font = new Font("Segoe UI Variable Text", 10f);
         void Prepare(ToolStripDropDown dd)
         {
-            void Restyle()
-            {
-                bool on = fluent();
-                dd.Renderer = on ? fluentRenderer : stockRenderer;
-                dd.Font = on ? fluentFont : stockFont;
-                dd.Padding = on ? new Padding(0, 4, 0, 4) : new Padding(0, 2, 0, 2);
-                if (on) dd.BackColor = MenuColors.Current.Back; else dd.ResetBackColor();
-                foreach (ToolStripItem it in dd.Items)
-                    if (it is not ToolStripSeparator)
-                        it.Padding = on ? new Padding(4, 5, 12, 5) : Padding.Empty;
-                if (dd.IsHandleCreated) RoundCorners(dd.Handle, on);
-            }
-            dd.HandleCreated += (_, _) => RoundCorners(dd.Handle, fluent());
-            dd.Opening += (_, _) => Restyle();
-            Restyle();
+            dd.Renderer = renderer;
+            dd.Font = font;
+            dd.Padding = new Padding(0, 4, 0, 4);
+            foreach (ToolStripItem it in dd.Items)
+                if (it is not ToolStripSeparator)
+                    it.Padding = new Padding(4, 5, 12, 5);
+            // Back color follows the system light/dark theme, which can change while running.
+            dd.Opening += (_, _) => dd.BackColor = MenuColors.Current.Back;
+            dd.BackColor = MenuColors.Current.Back;
+            dd.HandleCreated += (_, _) => RoundCorners(dd.Handle);
             foreach (ToolStripItem it in dd.Items)
                 if (it is ToolStripMenuItem { HasDropDownItems: true } mi) Prepare(mi.DropDown);
         }
@@ -41,9 +33,9 @@ static class FluentMenu
         menu.ShowCheckMargin = false;
     }
 
-    static void RoundCorners(IntPtr hwnd, bool round)
+    static void RoundCorners(IntPtr hwnd)
     {
-        int pref = round ? 2 : 1; // DWMWCP_ROUND : DWMWCP_DONOTROUND
+        int pref = 2; // DWMWCP_ROUND
         try { DwmSetWindowAttribute(hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, ref pref, sizeof(int)); }
         catch { /* older Windows: square corners */ }
     }

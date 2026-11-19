@@ -149,7 +149,7 @@ class BatteryApp : ApplicationContext
 
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, (_, _) => Exit());
-        FluentMenu.Apply(menu, () => skin.FluentMenu);
+        FluentMenu.Apply(menu);
         return menu;
     }
 
