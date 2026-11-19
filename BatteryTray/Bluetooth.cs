@@ -12,22 +12,18 @@ static class BluetoothProps
     [StructLayout(LayoutKind.Sequential)]
     struct SP_DEVINFO_DATA { public int cbSize; public Guid ClassGuid; public uint DevInst; public IntPtr Reserved; }
 
-    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    static extern IntPtr SetupDiGetClassDevs(IntPtr classGuid, string enumerator, IntPtr hwnd, int flags);
     [DllImport("setupapi.dll", SetLastError = true)]
-    static extern bool SetupDiEnumDeviceInfo(IntPtr set, int idx, ref SP_DEVINFO_DATA d);
+    static extern bool SetupDiEnumDeviceInfo(DeviceInfoSet set, int idx, ref SP_DEVINFO_DATA d);
     [DllImport("setupapi.dll", EntryPoint = "SetupDiGetDevicePropertyW", SetLastError = true)]
-    static extern bool SetupDiGetDeviceProperty(IntPtr set, ref SP_DEVINFO_DATA d, ref DEVPROPKEY key, out uint type, byte[]? buf, int size, out int req, int flags);
+    static extern bool SetupDiGetDeviceProperty(DeviceInfoSet set, ref SP_DEVINFO_DATA d, ref DEVPROPKEY key, out uint type, byte[]? buf, int size, out int req, int flags);
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    static extern bool SetupDiGetDeviceInstanceId(IntPtr set, ref SP_DEVINFO_DATA d, char[] buf, int size, out int req);
-    [DllImport("setupapi.dll")] static extern bool SetupDiDestroyDeviceInfoList(IntPtr set);
+    static extern bool SetupDiGetDeviceInstanceId(DeviceInfoSet set, ref SP_DEVINFO_DATA d, char[] buf, int size, out int req);
 
-    const int DIGCF_ALLCLASSES = 0x4;
-    static DEVPROPKEY FriendlyName = new("a45c254e-df1c-4efd-8020-67d146a850e0", 14);
-    static DEVPROPKEY Battery      = new("104EA319-6EE2-4701-BD47-8DDBF425BBE5", 2);
-    static DEVPROPKEY IsConnected  = new("83DA6326-97A6-4088-9453-A1923F573B29", 15);
+    static readonly DEVPROPKEY FriendlyName = new("a45c254e-df1c-4efd-8020-67d146a850e0", 14);
+    static readonly DEVPROPKEY Battery      = new("104EA319-6EE2-4701-BD47-8DDBF425BBE5", 2);
+    static readonly DEVPROPKEY IsConnected  = new("83DA6326-97A6-4088-9453-A1923F573B29", 15);
 
-    static byte[]? Get(IntPtr set, ref SP_DEVINFO_DATA d, DEVPROPKEY key)
+    static byte[]? Get(DeviceInfoSet set, ref SP_DEVINFO_DATA d, DEVPROPKEY key)
     {
         SetupDiGetDeviceProperty(set, ref d, ref key, out _, null, 0, out int req, 0);
         if (req <= 0) return null;
@@ -41,30 +37,26 @@ static class BluetoothProps
     {
         foreach (var enumerator in new[] { "BTHLE", "BTHENUM" })
         {
-            var set = SetupDiGetClassDevs(IntPtr.Zero, enumerator, IntPtr.Zero, DIGCF_ALLCLASSES);
-            if (set == new IntPtr(-1)) continue;
-            try
+            using var set = DeviceInfoSet.ForEnumerator(enumerator, DeviceInfoSet.DIGCF_ALLCLASSES);
+            if (set.IsInvalid) continue;
+            var d = new SP_DEVINFO_DATA { cbSize = Marshal.SizeOf<SP_DEVINFO_DATA>() };
+            for (int i = 0; SetupDiEnumDeviceInfo(set, i, ref d); i++)
             {
-                var d = new SP_DEVINFO_DATA { cbSize = Marshal.SizeOf<SP_DEVINFO_DATA>() };
-                for (int i = 0; SetupDiEnumDeviceInfo(set, i, ref d); i++)
-                {
-                    var idBuf = new char[512];
-                    if (!SetupDiGetDeviceInstanceId(set, ref d, idBuf, idBuf.Length, out _)) continue;
-                    var id = new string(idBuf).TrimEnd('\0');
-                    if (!id.StartsWith(enumerator + @"\DEV_", StringComparison.OrdinalIgnoreCase)) continue;
+                var idBuf = new char[512];
+                if (!SetupDiGetDeviceInstanceId(set, ref d, idBuf, idBuf.Length, out _)) continue;
+                var id = new string(idBuf).TrimEnd('\0');
+                if (!id.StartsWith(enumerator + @"\DEV_", StringComparison.OrdinalIgnoreCase)) continue;
 
-                    var nameBytes = Get(set, ref d, FriendlyName);
-                    var name = nameBytes is null ? "" : System.Text.Encoding.Unicode.GetString(nameBytes).TrimEnd('\0');
-                    if (!name.Contains(nameContains, StringComparison.OrdinalIgnoreCase)) continue;
+                var nameBytes = Get(set, ref d, FriendlyName);
+                var name = nameBytes is null ? "" : System.Text.Encoding.Unicode.GetString(nameBytes).TrimEnd('\0');
+                if (!name.Contains(nameContains, StringComparison.OrdinalIgnoreCase)) continue;
 
-                    var conn = Get(set, ref d, IsConnected);
-                    var bat = Get(set, ref d, Battery);
-                    bool connected = conn is { Length: > 0 } && conn[0] != 0;
-                    int? battery = bat is { Length: > 0 } && bat[0] <= 100 ? bat[0] : null;
-                    return (connected, battery);
-                }
+                var conn = Get(set, ref d, IsConnected);
+                var bat = Get(set, ref d, Battery);
+                bool connected = conn is { Length: > 0 } && conn[0] != 0;
+                int? battery = bat is { Length: > 0 } && bat[0] <= 100 ? bat[0] : null;
+                return (connected, battery);
             }
-            finally { SetupDiDestroyDeviceInfoList(set); }
         }
         return null;
     }
@@ -74,16 +66,16 @@ static class BluetoothProps
 class XboxController : IBatteryDevice
 {
     public string Name => "Xbox Controller";
+    public string Glyph => ""; // game controller
     public bool QuickPoll => true;
+    public bool HideWhenDisconnected => true;
 
     public BatteryReading Read()
     {
-        (bool connected, int? battery)? q;
-        try { q = BluetoothProps.Query("Xbox Wireless Controller"); }
-        catch (Exception ex) { return new(null, false, "Error: " + ex.Message, Hidden: true); }
-        if (q is null) return new(null, false, "Not paired", Hidden: true);
-        if (!q.Value.connected) return new(null, false, "Disconnected", Hidden: true);
-        if (q.Value.battery is not int pct) return new(null, false, "Connected, battery unknown");
-        return new(pct, false, $"{pct}%");
+        var q = BluetoothProps.Query("Xbox Wireless Controller");
+        if (q is null) return BatteryReading.Disconnected("Not paired");
+        if (!q.Value.connected) return BatteryReading.Disconnected("Disconnected");
+        if (q.Value.battery is not int pct) return BatteryReading.Unknown("Connected, battery unknown");
+        return BatteryReading.Level(pct, false, $"{pct}%");
     }
 }

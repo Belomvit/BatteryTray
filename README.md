@@ -12,19 +12,21 @@ A tiny Windows 11 utility that shows the battery level of wireless peripherals *
 | **ATK X1 Ultimate** mouse (Compx chipset) | 8K dongle (`373B:11D9`) | Vendor HID report `0x08`, command `0x04` → level, charging flag, voltage |
 | **Xbox Wireless Controller** | Bluetooth | Battery value Windows keeps for paired devices (same as *Settings → Bluetooth & devices*) |
 
-Devices that are turned off show **Off**; the Xbox controller is hidden while it's disconnected. A bolt icon appears while a device is charging.
+Devices that are turned off show **Off**; the Xbox controller is hidden while it's disconnected and appears as soon as it connects. A bolt icon appears while a device is charging.
+
+![Headset, mouse and Xbox controller](docs/controller.png)
 
 ## Styles
 
 Pick a look from the right‑click menu → **Style**. It's remembered across restarts.
 
-| Windows 11 | Modern | Classic (macOS) |
+| Windows 11 | Modern | Classic |
 |---|---|---|
 | ![Windows 11](docs/style-windows11.png) | ![Modern](docs/style-modern.png) | ![Classic](docs/style-classic.png) |
 
 - **Windows 11** — thin Fluent progress ring in the system accent color.
 - **Modern** — glassy capsules with a gradient level bar (amber/rose when low, green while charging).
-- **Classic** — the macOS *Batteries* look: green ring, red when low.
+- **Classic** — bolder green ring, red when low.
 
 All styles follow the system light/dark theme.
 
@@ -64,15 +66,22 @@ BatteryTray.exe --test readings.txt
 
 ## Adding a device
 
-Implement `IBatteryDevice` (see [`Devices.cs`](BatteryTray/Devices.cs)) — return a `BatteryReading` with the percentage, charging flag and a detail string — then add it to the `items` list in [`Program.cs`](BatteryTray/Program.cs) with a Segoe Fluent Icons glyph.
+Implement `IBatteryDevice` (see [`Devices.cs`](BatteryTray/Devices.cs)) — return a `BatteryReading` with the percentage, charging flag and a detail string — give it a Segoe Fluent Icons `Glyph`, and add it to `Devices.All` in the same file.
 
 ## Project structure
 
 | File | Purpose |
 |---|---|
-| `Program.cs` | Entry point, polling, settings, autostart, context menu |
-| `TaskbarWidget.cs` | Layered window embedded in the taskbar and its rendering |
-| `Fluent.cs` | Windows 11 colors/accent, styles, Fluent context‑menu renderer |
-| `Devices.cs` | Headset and mouse readers |
+| `Program.cs` | Entry point, polling (`BatteryApp`, `DeviceReader`), context menu |
+| `Devices.cs` | Device model (`BatteryReading`, `DeviceStatus`, `Devices.All`), headset and mouse readers |
 | `Bluetooth.cs` | Bluetooth battery properties, Xbox controller |
-| `Hid.cs` | Minimal Win32 HID helpers |
+| `Hid.cs`, `SetupApi.cs` | Minimal Win32 HID / SetupAPI helpers |
+| `TaskbarWidget.cs` | Layered window embedded in the taskbar |
+| `WeatherAnchor.cs` | Finds the weather button to place the widget next to |
+| `Skin.cs` | The styles table and the renderer interface |
+| `ItemView.cs` | What is shown per device (value, charging, low) |
+| `RingRenderer.cs`, `CapsuleRenderer.cs` | Drawing of the ring styles (Windows 11, Classic) and Modern |
+| `WidgetPainter.cs` | Shared drawing: frame, value text, bolt, icons |
+| `Theme.cs` | System light/dark and accent color, ring palettes |
+| `FluentMenu.cs` | Windows 11 styling of the context menu |
+| `Settings.cs`, `Autostart.cs` | Saved settings, Startup-folder shortcut |

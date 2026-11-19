@@ -10,7 +10,7 @@ static class Program
         if (args.Length == 2 && args[0] == "--test")
         {
             // Write one reading per device to a file, then exit (for troubleshooting).
-            var lines = new IBatteryDevice[] { new JblQuantum350(), new AtkMouse(), new XboxController() }.Select(d =>
+            var lines = Devices.All.Select(d =>
             {
                 try { var r = d.Read(); return $"{d.Name}: {r.Percent?.ToString() ?? "-"} | {r.Detail}"; }
                 catch (Exception ex) { return $"{d.Name}: ERROR {ex.Message}"; }
@@ -27,6 +27,8 @@ static class Program
         Application.ThreadException += (_, e) => ErrorLog.Write(e.Exception);
         AppDomain.CurrentDomain.UnhandledException += (_, e) => ErrorLog.Write(e.ExceptionObject as Exception);
         TaskScheduler.UnobservedTaskException += (_, e) => { ErrorLog.Write(e.Exception); e.SetObserved(); };
+        // Refreshes are async methods on the UI thread: make their continuations come back to it.
+        SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
         Application.Run(new BatteryApp());
     }
 }
@@ -52,46 +54,38 @@ static class ErrorLog
 /// Owns the devices, polls them on the user-chosen interval, and keeps the taskbar widget alive.
 class BatteryApp : ApplicationContext
 {
-    const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
-    const string AppName = "BatteryTray";
-    const string SettingsKey = @"Software\BatteryTray";
-    static readonly int[] IntervalChoices = [1, 5, 10, 15, 20, 30];
-    const int DefaultMinutes = 30;
+    /// Quick = re-check only devices that need it often (see <see cref="InQuickPass"/>), redrawing only on change.
+    enum RefreshKind { None, Quick, Full }
 
-    // Glyphs from Segoe Fluent Icons: headphones E7F6, mouse E962, game controller E7FC.
-    readonly List<WidgetItem> items =
-    [
-        new(new JblQuantum350(), "", "Headset"),
-        new(new AtkMouse(), "", "Mouse"),
-        new(new XboxController(), "", "Controller"),
-    ];
-
-    static readonly TimeSpan ReadTimeout = TimeSpan.FromSeconds(5);
+    readonly List<DeviceStatus> devices = Devices.All.Select(d => new DeviceStatus(d)).ToList();
+    readonly DeviceReader reader = new();
 
     readonly System.Windows.Forms.Timer quickTimer = new() { Interval = 20_000 };
-    readonly System.Windows.Forms.Timer pollTimer = new() { Interval = LoadMinutes() * 60_000 };
+    readonly System.Windows.Forms.Timer pollTimer = new() { Interval = Settings.RefreshMinutes * 60_000 };
     readonly System.Windows.Forms.Timer watchdog = new() { Interval = 3000 };
-    readonly SynchronizationContext ui;
+    readonly ContextMenuStrip menu;
+    Skin skin = Skin.For(Settings.Look);
     TaskbarWidget? widget;
-    int busy;                       // 1 while a refresh is running
-    bool pendingFull, pendingQuick; // refreshes requested meanwhile (UI thread only)
+    bool refreshing, closing;
+    RefreshKind pending; // strongest refresh requested while one was running
 
     public BatteryApp()
     {
-        ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
-        pollTimer.Tick += (_, _) => Refresh();
+        menu = BuildMenu();
+        SystemEvents.UserPreferenceChanged += OnThemeChanged;
+        pollTimer.Tick += (_, _) => Refresh(RefreshKind.Full);
+        quickTimer.Tick += (_, _) => Refresh(RefreshKind.Quick);
         watchdog.Tick += (_, _) =>
         {
             try { EnsureWidget(); }
             catch (Exception ex) { ErrorLog.Write(ex); }
         };
-        quickTimer.Tick += (_, _) => Refresh(quickOnly: true);
         quickTimer.Start();
         pollTimer.Start();
         watchdog.Start();
-        MigrateAutostart();
+        Autostart.Migrate();
         EnsureWidget();
-        Refresh();
+        Refresh(RefreshKind.Full);
     }
 
     /// (Re)creates the widget when Explorer starts late or restarts, and keeps it placed next to the weather.
@@ -101,20 +95,28 @@ class BatteryApp : ApplicationContext
         {
             widget?.Dispose();
             widget = null;
-            var w = new TaskbarWidget(items, BuildMenu(), Refresh);
+            var w = new TaskbarWidget(devices, skin, menu, () => Refresh(RefreshKind.Full));
             if (w.TryAttach()) widget = w;
             else w.Dispose();
         }
         widget?.Reposition();
     }
 
+    // Raised on this (UI) thread, since it subscribed here.
+    void OnThemeChanged(object? sender, UserPreferenceChangedEventArgs e)
+    {
+        if (e.Category is not (UserPreferenceCategory.General or UserPreferenceCategory.Color or UserPreferenceCategory.VisualStyle)) return;
+        SystemTheme.Invalidate();
+        widget?.Redraw();
+    }
+
     ContextMenuStrip BuildMenu()
     {
         var menu = new ContextMenuStrip();
-        menu.Items.Add("Refresh now", null, (_, _) => Refresh());
+        menu.Items.Add("Refresh now", null, (_, _) => Refresh(RefreshKind.Full));
 
         var every = new ToolStripMenuItem("Auto-refresh every");
-        foreach (int min in IntervalChoices)
+        foreach (int min in Settings.RefreshChoices)
         {
             var opt = new ToolStripMenuItem(min == 1 ? "1 minute" : $"{min} minutes") { Tag = min };
             opt.Click += (_, _) => SetInterval(min);
@@ -128,35 +130,36 @@ class BatteryApp : ApplicationContext
         menu.Items.Add(every);
 
         var autostart = new ToolStripMenuItem("Start with Windows");
-        autostart.Click += (_, _) => SetAutostart(!IsAutostart());
-        menu.Opening += (_, _) => autostart.Checked = IsAutostart();
+        autostart.Click += (_, _) => Autostart.Set(!Autostart.IsEnabled);
+        menu.Opening += (_, _) => autostart.Checked = Autostart.IsEnabled;
         menu.Items.Add(autostart);
 
         var style = new ToolStripMenuItem("Style");
-        foreach (var (look, name) in new[] { (Look.Windows11, "Windows 11"), (Look.Modern, "Modern"), (Look.Classic, "Classic (macOS)") })
+        foreach (var s in Skin.All)
         {
-            var opt = new ToolStripMenuItem(name) { Tag = look };
-            opt.Click += (_, _) => SetStyle(look);
+            var opt = new ToolStripMenuItem(s.Name) { Tag = s };
+            opt.Click += (_, _) => SetSkin(s);
             style.DropDownItems.Add(opt);
         }
         menu.Opening += (_, _) =>
         {
-            foreach (ToolStripMenuItem o in style.DropDownItems) o.Checked = (Look)o.Tag! == Fluent.Look;
+            foreach (ToolStripMenuItem o in style.DropDownItems) o.Checked = o.Tag is Skin s && s == skin;
         };
         menu.Items.Add(style);
 
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, (_, _) => Exit());
-        Fluent.Style(menu);
+        FluentMenu.Apply(menu, () => skin.FluentMenu);
         return menu;
     }
 
-    /// Switches the widget look (Windows 11, Modern or Classic); remembered across restarts.
-    void SetStyle(Look look)
+    /// Switches the widget look; remembered across restarts.
+    void SetSkin(Skin s)
     {
-        if (Fluent.Look == look) return;
-        Fluent.SetLook(look);
-        widget?.Redraw();
+        if (s == skin) return;
+        skin = s;
+        Settings.Look = s.Look;
+        widget?.SetSkin(s);
     }
 
     /// Changes the auto-refresh period, remembers it, and restarts the countdown.
@@ -165,160 +168,83 @@ class BatteryApp : ApplicationContext
         pollTimer.Stop();
         pollTimer.Interval = minutes * 60_000;
         pollTimer.Start();
-        try
-        {
-            using var k = Registry.CurrentUser.CreateSubKey(SettingsKey);
-            k.SetValue("RefreshMinutes", minutes, RegistryValueKind.DWord);
-        }
-        catch { /* not critical: falls back to the default next start */ }
+        Settings.RefreshMinutes = minutes;
     }
 
-    static int LoadMinutes()
-    {
-        try
-        {
-            using var k = Registry.CurrentUser.OpenSubKey(SettingsKey);
-            if (k?.GetValue("RefreshMinutes") is int m && IntervalChoices.Contains(m)) return m;
-        }
-        catch { }
-        return DefaultMinutes;
-    }
+    /// The quick pass covers cheap devices (Bluetooth), plus anything showing "Off"
+    /// (e.g. a mouse that was asleep) so it comes back soon after waking.
+    static bool InQuickPass(DeviceStatus d) => d.Device.QuickPoll || (d.Visible && d.Reading is { Percent: null });
 
-    void Refresh() => Refresh(quickOnly: false);
-
-    /// quickOnly: re-check only cheap devices (Bluetooth), redrawing only if something changed.
-    /// A refresh requested while another is running is queued and runs right after it.
-    void Refresh(bool quickOnly)
+    /// Runs on the UI thread. A refresh requested while another is running is queued
+    /// (a full one wins over a quick one) and runs right after it.
+    async void Refresh(RefreshKind kind)
     {
-        if (Interlocked.Exchange(ref busy, 1) == 1)
+        if (closing) return;
+        if (refreshing)
         {
-            if (quickOnly) pendingQuick = true; else pendingFull = true;
+            if (kind > pending) pending = kind;
             return;
         }
-        // Quick pass: cheap devices, plus anything showing "Off" (e.g. a mouse that was asleep) so it comes back soon.
-        var targets = items.Where(it => !quickOnly || it.Device.QuickPoll
-                                        || (it.Reading is { Percent: null, Hidden: false })).ToList();
-        Task.Run(() =>
+        refreshing = true;
+        while (kind != RefreshKind.None && !closing)
         {
-            List<BatteryReading>? results = null;
-            try { results = targets.Select(ReadWithTimeout).ToList(); }
+            // One failure must never stop future updates.
+            try { await RefreshOnce(kind); }
             catch (Exception ex) { ErrorLog.Write(ex); }
-
-            ui.Post(_ =>
-            {
-                try
-                {
-                    if (results is null) return;
-                    bool changed = false;
-                    for (int i = 0; i < targets.Count; i++)
-                    {
-                        if (targets[i].Reading != results[i]) changed = true;
-                        targets[i].Reading = results[i];
-                    }
-                    if (changed || !quickOnly) widget?.Redraw();
-                }
-                catch (Exception ex) { ErrorLog.Write(ex); }
-                finally
-                {
-                    // Always release, so one failure can never stop future updates.
-                    Volatile.Write(ref busy, 0);
-                    if (pendingFull) { pendingFull = pendingQuick = false; Refresh(quickOnly: false); }
-                    else if (pendingQuick) { pendingQuick = false; Refresh(quickOnly: true); }
-                }
-            }, null);
-        });
-    }
-
-    /// Reads one device, giving up after <see cref="ReadTimeout"/> so a wedged dongle can't
-    /// freeze updates. A read that is still stuck from last time is not started again.
-    static BatteryReading ReadWithTimeout(WidgetItem it)
-    {
-        bool keepHidden = it.Reading?.Hidden == true;
-        if (it.InFlight is { IsCompleted: false })
-            return new(null, false, "Not responding", Hidden: keepHidden);
-
-        var task = Task.Run(it.Device.Read);
-        it.InFlight = task;
-        try
-        {
-            return task.Wait(ReadTimeout) ? task.Result : new(null, false, "Not responding (timed out)", Hidden: keepHidden);
+            (kind, pending) = (pending, RefreshKind.None);
         }
-        catch (AggregateException ex)
+        refreshing = false;
+    }
+
+    async Task RefreshOnce(RefreshKind kind)
+    {
+        var targets = kind == RefreshKind.Full ? devices : devices.Where(InQuickPass).ToList();
+        var readings = await Task.WhenAll(targets.Select(t => reader.Read(t.Device)));
+        bool changed = false;
+        for (int i = 0; i < targets.Count; i++)
         {
-            return new(null, false, "Error: " + (ex.InnerException?.Message ?? ex.Message), Hidden: keepHidden);
+            changed |= targets[i].Reading != readings[i];
+            targets[i].Reading = readings[i];
         }
-    }
-
-    // Autostart is a shortcut in the user's Startup folder, so it shows up (and can be toggled)
-    // in Task Manager / Settings > Startup apps. Windows records a toggle there in StartupApproved.
-    const string ApprovedKey = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder";
-    static readonly string ShortcutName = AppName + ".lnk";
-    static string ShortcutPath =>
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), ShortcutName);
-
-    static bool IsAutostart()
-    {
-        if (!File.Exists(ShortcutPath)) return false;
-        try
-        {
-            // Odd first byte = switched off in Startup apps.
-            using var k = Registry.CurrentUser.OpenSubKey(ApprovedKey);
-            if (k?.GetValue(ShortcutName) is byte[] { Length: > 0 } b && (b[0] & 1) == 1) return false;
-        }
-        catch { }
-        return true;
-    }
-
-    static void SetAutostart(bool on)
-    {
-        try
-        {
-            RemoveLegacyRunEntry();
-            if (on) CreateShortcut();
-            else if (File.Exists(ShortcutPath)) File.Delete(ShortcutPath);
-            // Clear any "disabled" flag so the Startup apps toggle matches.
-            using var k = Registry.CurrentUser.OpenSubKey(ApprovedKey, writable: true);
-            k?.DeleteValue(ShortcutName, false);
-        }
-        catch (Exception ex) { ErrorLog.Write(ex); }
-    }
-
-    /// Older versions used the Run key, which Windows was silently skipping; move it to the shortcut.
-    static void MigrateAutostart()
-    {
-        try
-        {
-            using var k = Registry.CurrentUser.OpenSubKey(RunKey);
-            if (k?.GetValue(AppName) is not string) return;
-            RemoveLegacyRunEntry();
-            if (!File.Exists(ShortcutPath)) CreateShortcut();
-        }
-        catch (Exception ex) { ErrorLog.Write(ex); }
-    }
-
-    static void RemoveLegacyRunEntry()
-    {
-        using var k = Registry.CurrentUser.OpenSubKey(RunKey, writable: true);
-        k?.DeleteValue(AppName, false);
-    }
-
-    static void CreateShortcut()
-    {
-        var shellType = Type.GetTypeFromProgID("WScript.Shell")!;
-        dynamic shell = Activator.CreateInstance(shellType)!;
-        dynamic lnk = shell.CreateShortcut(ShortcutPath);
-        lnk.TargetPath = Environment.ProcessPath;
-        lnk.WorkingDirectory = Path.GetDirectoryName(Environment.ProcessPath);
-        lnk.Description = "Battery levels on the taskbar";
-        lnk.Save();
+        if (changed || kind == RefreshKind.Full) widget?.Redraw();
     }
 
     void Exit()
     {
+        closing = true;
+        SystemEvents.UserPreferenceChanged -= OnThemeChanged;
         pollTimer.Stop();
         quickTimer.Stop();
         watchdog.Stop();
         widget?.Dispose();
+        widget = null;
+        menu.Dispose();
         ExitThread();
+    }
+}
+
+/// Reads devices off the UI thread, each on its own (the devices are independent, so a refresh
+/// takes as long as the slowest one, not the sum). Gives up after <see cref="Timeout"/> so a wedged
+/// dongle can't freeze updates; a read that is still stuck from last time is not started again.
+sealed class DeviceReader
+{
+    static readonly TimeSpan Timeout = TimeSpan.FromSeconds(5);
+    readonly Dictionary<IBatteryDevice, Task<BatteryReading>> inFlight = []; // UI thread only
+
+    public async Task<BatteryReading> Read(IBatteryDevice device)
+    {
+        if (inFlight.TryGetValue(device, out var stuck) && !stuck.IsCompleted)
+            return BatteryReading.Failed("Not responding");
+
+        var task = Task.Run(device.Read);
+        inFlight[device] = task;
+        try { return await task.WaitAsync(Timeout); }
+        catch (TimeoutException)
+        {
+            // If the abandoned read fails later, observe it so it doesn't end up in the error log.
+            _ = task.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+            return BatteryReading.Failed("Not responding (timed out)");
+        }
+        catch (Exception ex) { return BatteryReading.Failed("Error: " + ex.Message); }
     }
 }
