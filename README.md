@@ -85,3 +85,7 @@ Implement `IBatteryDevice` (see [`Devices.cs`](BatteryTray/Devices.cs)) — retu
 | `Theme.cs` | System light/dark and accent color, ring palettes |
 | `FluentMenu.cs` | Windows 11 styling of the context menu |
 | `Settings.cs`, `Autostart.cs` | Saved settings, Startup-folder shortcut |
+
+## Disclaimer
+
+This project is not affiliated with, endorsed by, or sponsored by JBL or ATK. All product names are trademarks of their respective owners.
